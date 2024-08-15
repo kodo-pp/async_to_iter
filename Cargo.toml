@@ -1,5 +1,5 @@
 [package]
-name = "async-to-iter"
+name = "async_to_iter"
 version = "0.1.0"
 edition = "2021"
 
