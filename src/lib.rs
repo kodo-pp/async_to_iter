@@ -9,6 +9,48 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+/// Sink for iterator output values to be used in async code.
+///
+/// See [`make_iter()`] for a complete usage example.
+pub struct IterSink<T> {
+    inner: Rc<IterSinkInner<T>>,
+}
+
+impl<T> IterSink<T> {
+    fn new(inner: Rc<IterSinkInner<T>>) -> Self {
+        Self { inner }
+    }
+
+    /// Yield a value from the iterator.
+    ///
+    /// The returned future is meant to be awaited from async code.
+    ///
+    /// Usage example:
+    /// ```rust
+    /// # use async_to_iter::IterSink;
+    /// async fn my_iterator(sink: IterSink<u32>, some_flag: bool) {
+    ///     sink.yield_value(2).await;
+    ///     if some_flag {
+    ///         sink.yield_value(5).await;
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Note: this method should only be used in async code launched by [`make_iter()`].
+    /// It should not be used from async code running inside a third-party
+    /// or a custom async runtime (including `tokio` or `async-std`) — this can cause deadlocks,
+    /// panics and other kinds of incorrect behavior (although there will not be undefined
+    /// behavior).
+    pub fn yield_value(&self, value: T) -> impl Future<Output = ()> {
+        self.inner.set_value(value);
+        IterYield::new()
+    }
+}
+
+/// Internal data storage of the sink for iterator output values.
+///
+/// Stores a value yielded from async code until it is collected by [`IterAdapter`] and its
+/// [`Iterator`] implementation.
 struct IterSinkInner<T> {
     value: Cell<Option<T>>,
 }
@@ -29,21 +71,10 @@ impl<T> IterSinkInner<T> {
     }
 }
 
-pub struct IterSink<T> {
-    inner: Rc<IterSinkInner<T>>,
-}
-
-impl<T> IterSink<T> {
-    fn new(inner: Rc<IterSinkInner<T>>) -> Self {
-        Self { inner }
-    }
-
-    pub fn yield_value(&self, value: T) -> impl Future<Output = ()> {
-        self.inner.set_value(value);
-        IterYield::new()
-    }
-}
-
+/// Future returned from [`IterSink::yield_value`].
+///
+/// This future suspends (returns [`Poll::Pending`]) exactly once,
+/// and becomes ready when it is polled the next time.
 struct IterYield {
     suspended: bool,
 }
@@ -67,6 +98,7 @@ impl Future for IterYield {
     }
 }
 
+/// Make a no-op [`RawWaker`], like unstable [`core::task::Waker::noop()`] does.
 fn make_noop_raw_waker() -> RawWaker {
     fn noop(_: *const ()) {}
 
@@ -77,6 +109,7 @@ fn make_noop_raw_waker() -> RawWaker {
     RawWaker::new(core::ptr::null(), &VTABLE)
 }
 
+/// Make a no-op [`Waker`], like unstable [`core::task::Waker::noop()`] does.
 fn make_noop_waker() -> Waker {
     let raw_waker = make_noop_raw_waker();
 
@@ -84,6 +117,7 @@ fn make_noop_waker() -> Waker {
     unsafe { Waker::from_raw(raw_waker) }
 }
 
+/// The iterator adapter that translates [`Iterator::next()`] into [`Future::poll()`] calls.
 struct IterAdapter<T, Fut> {
     iter_sink_inner: Rc<IterSinkInner<T>>,
     future: Pin<Box<Fut>>,
@@ -97,7 +131,10 @@ impl<T, Fut> IterAdapter<T, Fut> {
         let iter_sink_inner = Rc::new(IterSinkInner::new());
         let iter_sink = IterSink::new(Rc::clone(&iter_sink_inner));
         let future = Box::pin(into_future(iter_sink));
-        Self { iter_sink_inner, future }
+        Self {
+            iter_sink_inner,
+            future,
+        }
     }
 }
 
@@ -121,6 +158,38 @@ where
     }
 }
 
+/// Create an iterator implemented by async code.
+///
+/// Async code that provides the iterator implementation is accepted via the `into_future`
+/// parameter, which is a function that accepts an [`IterSink`] and returns a future, usually one
+/// returned by an async function. This can be used to turn an async function to a generator on
+/// stable Rust.
+///
+/// The async code can use [`IterSink::yield_value()`] to yield values from the iterator. Each
+/// yielded value will be returned from one call to `Iterator::next()`. Async code should only
+/// await on futures returned by `IterSink` (or transitively on futures that do so), otherwise
+/// the behavior may be incorrect, including deadlocks or panics.
+///
+/// Usage example:
+///
+/// ```
+/// # use async_to_iter::{IterSink, make_iter};
+/// async fn count_to_impl(sink: IterSink<u32>, n: u32) {
+///     for i in 1..=n {
+///         sink.yield_value(i).await;
+///     }
+/// }
+///
+/// fn count_to(n: u32) -> impl Iterator<Item = u32> {
+///     make_iter(move |sink| count_to_impl(sink, n))
+/// }
+///
+/// let mut iter = count_to(3);
+/// assert_eq!(iter.next(), Some(1));
+/// assert_eq!(iter.next(), Some(2));
+/// assert_eq!(iter.next(), Some(3));
+/// assert_eq!(iter.next(), None);
+/// ```
 pub fn make_iter<T, Fut, IntoFut>(into_future: IntoFut) -> impl Iterator<Item = T>
 where
     Fut: Future<Output = ()>,
@@ -158,10 +227,7 @@ mod tests {
         assert_eq!(iter.next(), Some(12));
     }
 
-    async fn join_to_strings_impl(
-        sink: IterSink<String>,
-        chars: impl IntoIterator<Item = char>,
-    ) {
+    async fn join_to_strings_impl(sink: IterSink<String>, chars: impl IntoIterator<Item = char>) {
         let mut is_whitespace = true;
         let mut current_string = String::new();
         for c in chars {
