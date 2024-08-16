@@ -167,8 +167,8 @@ where
 /// stable Rust.
 ///
 /// The async code can use [`IterSink::yield_value()`] to yield values from the iterator. Each
-/// yielded value will be returned from one call to `Iterator::next()`. Async code should only
-/// await on futures returned by `IterSink` (or transitively on futures that do so), otherwise
+/// yielded value will be returned from one call to [`Iterator::next()`]. Async code should only
+/// await on futures returned by [`IterSink`] (or transitively on futures that do so), otherwise
 /// the behavior may be incorrect, including deadlocks or panics.
 ///
 /// Usage example:
